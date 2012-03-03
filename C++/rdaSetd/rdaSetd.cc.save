@@ -1,0 +1,410 @@
+#include <TcpSocket.h>
+#include <IpAddress.h>
+#include <ChildProcess.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/resource.h>
+#include <sys/ioctl.h>
+#include <sys/filio.h>
+#include <Unistd.h>
+#include <stdlib.h>
+#include <syslog.h>
+#include <iostream.h>
+#include <string.h>
+#include <errno.h>
+#include <compiler.h>
+
+#define LOGINFO (LOG_DAEMON|LOG_NOTICE)
+#define LOGERR (LOG_MAIL|LOG_CRIT)
+
+// constants
+static const int MaxChild = 300;
+
+///////////////////////////////////////////////////////////////////////////////
+// Dbuffer
+///////////////////////////////////////////////////////////////////////////////
+
+class Dbuffer
+{
+public:
+  Dbuffer();
+  ~Dbuffer();
+  void clear();
+  void append(const char *p, int s);
+  operator char*();
+
+private:
+  char *reallocate();
+  // attrubutes
+  int size;
+  int len;
+  char *content;
+};
+
+Dbuffer::Dbuffer()
+  :size(0),
+   len(0),
+   content(0)
+{
+}
+
+Dbuffer::~Dbuffer()
+{
+  clear();
+}
+
+void Dbuffer::clear()
+{
+  delete[] content;
+  size = 0;
+  len = 0;
+  content = 0;
+}
+
+char *Dbuffer::reallocate()
+{
+  size += 1024;
+  char *tmp = new char[size];
+  if(tmp)
+  {
+    memcpy(tmp, content, len);
+    delete[] content;
+    content = tmp;
+    return content;
+  }
+
+  size = 0;
+  len = 0;
+  syslog(LOGERR, "New %d failed, %s", strerror(errno));
+  return 0;
+}
+
+void Dbuffer::append(const char *p, int s)
+{
+  while(size < s)
+  {
+    if(!reallocate())
+      return;
+  }
+
+  memcpy(&content[len], p, s);
+  len += s;
+}
+
+inline
+Dbuffer::operator char*()
+{
+  return content;
+}
+
+
+///////////////////////////////////////////////////////////////////////////////
+// DaSetd
+///////////////////////////////////////////////////////////////////////////////
+
+class DaSetd
+{
+public:
+  DaSetd(const IpAddress&, bool daemon);
+  ~DaSetd();
+  void run();
+  void setApp(const char*);
+
+private:
+  void serverInit();
+  void inetInit(const IpAddress&);
+  bool spawnChildApp();
+  void cleanupChildApp(int child);
+  void multiplexData(TcpSocket& socket);
+  void handleConnection(TcpSocket *newConnect);
+  int setup(TcpSocket&, fd_set&);
+  void appendToChild(const char *p, int nbytes);
+  void forwardData(TcpSocket& socket);
+  void forwardData(TcpSocket& socket, int child);
+
+  struct Child
+  {
+    Child()
+      :proc(0){};
+    Dbuffer buffer;
+    ChildProcess *proc;
+  };
+
+  // attributes
+  TcpSocket listener;
+  const char *app;
+  Child childApps[MaxChild];
+  int activeChild;
+};
+
+DaSetd::DaSetd(const IpAddress& addr, bool daemon)
+  :app(0),
+   activeChild(-1)
+{
+  if(daemon) serverInit();
+  inetInit(addr);
+}
+
+DaSetd::~DaSetd()
+{
+}
+
+void DaSetd::setApp(const char* aValue)
+{
+  app = aValue;
+}
+
+void DaSetd::serverInit()
+{
+  pid_t pid = fork();
+  switch(pid)
+  {
+    case -1:
+      syslog(LOGERR, "fork failed, %s", strerror(errno));
+      exit(0);
+      break;
+    case 0: // child
+      setsid();
+      {
+        rlimit newLimit;
+        newLimit.rlim_cur = 200;
+        newLimit.rlim_max = 200;
+        setrlimit(RLIMIT_NOFILE, &newLimit);
+      }
+      break;
+    default: // parent
+      waitpid(pid, 0, WNOHANG);
+      exit(0);
+  }
+}
+
+void DaSetd::inetInit(const IpAddress& addr)
+{
+  listener.bind(addr);
+  listener.listen();
+};
+
+bool DaSetd::spawnChildApp()
+{
+  ChildProcess *child = new ChildProcess(app);
+  if(child)
+  {
+    int fd;
+    fd = child->execute();
+    if(fd != -1)
+    {
+      childApps[fd].proc = child;
+      activeChild = fd;
+      return true;
+    }
+    else
+      syslog(LOGERR, "Spawn child failed");
+  }
+
+  return false;
+}
+
+void DaSetd::cleanupChildApp(int child)
+{
+  Child& ch = childApps[child];
+  delete ch.proc;
+  ch.proc = 0;
+  ch.buffer.clear();
+  if(child == activeChild)
+    activeChild = -1;
+}
+
+int DaSetd::setup(TcpSocket& socket, fd_set& set)
+{
+  FD_ZERO(&set);
+  int maxfd = socket.getfd();
+  FD_SET(maxfd, &set);
+  for(int i = 0; i < MaxChild; i++)
+  {
+    if(childApps[i].proc)
+    {
+      FD_SET(i, &set);
+      if(i > maxfd) maxfd = i;
+    }
+  }
+
+  return maxfd+1;
+}
+
+void DaSetd::appendToChild(const char *p, int nbytes)
+{
+  if(activeChild == -1)
+  {
+    if(!spawnChildApp())
+      return;
+  }
+
+  childApps[activeChild].buffer.append(p, nbytes);
+  if(p[nbytes-1] == '\n')
+  {
+    activeChild = -1;
+  }
+}
+
+void DaSetd::forwardData(TcpSocket& socket)
+{
+  static char buffer[1024];
+  memset(buffer, 0, sizeof(buffer));
+  int nbytes = socket.bytesToRead(sizeof(buffer));
+  if(nbytes == 0)
+    throw TcpSocket::Disconnect("read", __FILE__, __LINE__);
+  socket.read(buffer, nbytes);
+  for(int start = 0, end = 0; end < nbytes; end++)
+  {
+    if((end == nbytes) || (buffer[end] == '\n'))
+    {
+      int n = ((end-start)+(end < nbytes ? 1 : 0));
+      appendToChild(&buffer[start], n);
+      start = end+1;
+    }
+  }
+}
+
+void DaSetd::forwardData(TcpSocket& socket, int child)
+{
+  static char buffer[1024];
+  memset(buffer, 0, sizeof(buffer));
+  int nbytes = childApps[child].proc->bytesToRead(sizeof(buffer));
+  if(childApps[child].proc->readStdout(buffer, nbytes))
+    socket.write(buffer, nbytes);
+  else
+    cleanupChildApp(child);
+}
+
+void DaSetd::multiplexData(TcpSocket& socket)
+{
+  fd_set rdset;
+  int numfd, maxfd;
+  int clientfd = socket.getfd();
+
+  while(1)
+  {
+    maxfd = setup(socket, rdset);
+    numfd = select(maxfd, &rdset, 0, 0, 0);
+    for(int fd = maxfd; ((numfd > 0) && (fd >= 0)); fd--)
+    {
+      if(FD_ISSET(fd, &rdset))
+      {
+        if(fd == clientfd)
+          forwardData(socket);
+        else
+          forwardData(socket, fd);
+      }
+    }
+  }
+}
+
+void DaSetd::handleConnection(TcpSocket *newConnect)
+{
+  if(newConnect)
+  {
+    syslog(LOGINFO, "Connection accepted (fd=%d)",
+      newConnect->getfd());
+
+    newConnect->setLinger(0);
+    newConnect->setNoDelay(true);
+    pid_t pid = fork();
+    switch(pid)
+    {
+      case -1:
+        syslog(LOGERR, "fork failed, %s", strerror(errno));
+        break;
+      case 0: // child
+        listener.close();
+        multiplexData(*newConnect);
+        exit(0);
+        break;
+      default: // parent
+        waitpid(pid, 0, WNOHANG);
+        break;
+    }
+    newConnect->close();
+    delete newConnect;
+  }
+}
+
+void DaSetd::run()
+{
+  while(1)
+  {
+    handleConnection(listener.accept());
+  }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Main
+///////////////////////////////////////////////////////////////////////////////
+
+static void showUsage()
+{
+  cout << endl;
+  cout << "usage: rdaSetd [ -h ] [ -a address (optional)] ";
+  cout << "[ -p port ] [ -e program ]" << endl;
+  cout << endl;
+}
+
+int main(int argc, char** argv)
+{
+  char *program = 0, *ip = 0;
+  int opt, port = 0;
+  bool daemon = true;
+  while((opt = getopt(argc, argv, "a:hp:e:f")) != -1)
+  {
+    switch(opt)
+    {
+      case 'p':
+        port = atoi(optarg);
+        break;
+      case 'a':
+        ip = strdup(optarg);
+        break;
+      case 'e':
+        program = strdup(optarg);
+        break;
+      case 'h':
+        showUsage();
+        return 0;
+        break;
+      case 'f':
+        daemon = false;
+        break;
+      case '?':
+        showUsage();
+        return 0;
+        break;
+    }
+  }
+
+  if((port == 0) || (program == 0))
+  {
+    showUsage();
+    return 1;
+  }
+
+  syslog(LOGINFO, "Started addr=%s port=%d exec=\"%s\"",
+    (ip ? ip : "ALL"), port, program);
+
+  try
+  {
+    IpAddress addr(ip, port);
+    DaSetd server(addr, daemon);
+    server.setApp(program);
+    syslog(LOGINFO, "Started");
+    server.run();
+  }
+  catch(TcpSocket::Disconnect& e)
+  {
+    syslog(LOGERR, "Connection terminated");
+  }
+  catch(NetErr& e)
+  {
+    syslog(LOGERR, "Exception %s", e.errm);
+  }
+
+  return 0;
+}

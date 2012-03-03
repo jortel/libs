@@ -1,0 +1,57 @@
+PACKAGE/BUILD:
+
+Please find attached 2 compressed tar files.  They contains several files that make up a
+networking library and 3 other files that are the application mains.  The networking lib
+will also be used for the SNMP routing application.  Please uncompress the rdaSet.tar.Z
+using Unix uncompress.  Then, extract the files from the archive.  The default target in
+the rdaSet.mk makefile is all.  It will make the rdaSet and rdaSetd applications.  The
+makefile will have to be edited to find your CC compiler and ar (archive) commands.
+It currently expects to use the GNU g++ compiler and find ar in the path.
+To build type the following:
+
+  make -f rdaSet.mk
+
+You may build my dummy daSet application if you need to by typing the following:
+
+  make -f rdaSet.mk daSet
+
+DESCRIPTION:
+
+The rdaSetd (daemon) is the remote daSet server.  It should be started on the host where
+daSet is located.  It should be started as follows: 
+
+  rdaSetd -p <port#> -e </.../daSet>
+
+There is no need to suffix the command with an & since the daemon is designed run in the
+background.  The -p is a port number and -e is the path'd executable (daSet) that the server
+will spawn/invoke to handle the work order that is received from the client.  If the executable
+may be found in the path, only the name is required.  An optional -a option may be specified to
+select a specific network interface.  A hostname or an IP address may be supplied.  If not
+specified, it will listen on all interfaces.
+
+The rdaSet (application) is the remote daSet client.  It may be used from anywhere that has
+network access to the host running the server.  It is started as follows:
+
+  rdaSet <host> <port#> < ... >
+
+The <host> is the host running the server and may be either a hostname or an IP address.  The
+<port> must be the port that the server is listening on.
+
+ARCHITECTURE:
+
+The rdaSet client will connect to the server via TCP/IP and send all of its command
+line arguments except the host and port.  The rdaSetd server is concurrent.  It will spawn a
+child process to handle the connection and continue listening for more connections.
+The server will invoke a local copy of the specified executable (-e option) with the
+arguments received from the client.  All stdout and stderr data is piped back to the
+server who will forward it to the client over the connection.  The client will display
+the data on stdout.
+
+A telnet (TELNET) client may be used with the rdaSetd server.  Once connected, the
+server will expect work orders to be seperated by a newline.  Both single and double
+quote shell semantics are supported.
+
+The server will log both INFO (LOG_DAEMON|LOG_NOTICE) and ERROR (LOG_MAIL|LOG_CRIT)
+messages to the syslog (/var/adm/messages).  I am using the above facilities/severity
+because that is how my machine is configured.  I will change it to something more appropriate
+in the final release. 

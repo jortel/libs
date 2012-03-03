@@ -1,0 +1,41 @@
+PACKAGE/BUILD:
+
+Please find attached 2 compressed tar files.  They contains several files that make up a
+networking library and 1 other file that is the application main.  The networking lib
+will also be used for other cyberwerx applications.  Please uncompress the snmpRouted.tar.Z
+using Unix uncompress.  Then, extract the files from the archive.  The default target in
+the snmpRouted.mk makefile is all.  It will make the snmpRouted application.
+The makefile will have to be edited to find your CC compiler and ar (archive) commands.
+It currently expects to use the GNU g++ compiler and find ar in the path.
+To build type the following:
+
+  make -f snmpRouted.mk
+
+You may build my SNMP send test application if you need to by typing the following:
+
+  make -f snmpRouted.mk send
+
+DESCRIPTION:
+
+The snmpRouted (daemon) is the SNMP packet router.  It may be started on any host where
+the desired port is available.  It should be started as follows: 
+
+  snmpRouted -p <port#> -d host:port
+
+There is no need to suffix the command with an & since the daemon is designed run in the
+background.  The -p is a port number and -d is the destination host and port# separated
+by a ":" colon.
+
+ARCHITECTURE:
+
+The router will listen for snmp packets on the specified port and route them to the
+specified destination.  It will wait 30 seconds for a response.  Once the first response
+packet is received it will then wait 3 seconds between packets.  Each response packet
+is routed back to the address and port that originated the exchange.  The routing is
+bi-directional.  A maximum of 500 simultaneous routing operations (requests) may be
+outstanding at one time.  Additional packets will be discarded.
+
+The server will log both INFO (LOG_DAEMON|LOG_NOTICE) and ERROR (LOG_MAIL|LOG_CRIT)
+messages to the syslog (/var/adm/messages).  I am using the above facilities/severity
+because that is how my machine is configured.  I will change it to something more appropriate
+in the final release.
